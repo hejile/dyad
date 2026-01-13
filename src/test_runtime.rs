@@ -188,7 +188,7 @@ mod tests {
                 dh.modify(|s| {
                     s.msgs.push(format!("count {}", i));
                 });
-                sleep_cycles(2).await;
+                sleep_cycles(3).await;
             }
             dh.modify(|s| {
                 s.sender_done = true;
@@ -199,7 +199,11 @@ mod tests {
             let msg_available = dh.add_predicate(|s| !s.msgs.is_empty());
             let sender_done = dh.add_predicate(|s| s.sender_done);
 
+            let mut count = 0;
             loop {
+                count += 1;
+                println!("receiver waiting at iteration {}", count);
+                dh.wait_until(&msg_available | &sender_done).await;
                 if sender_done.is_ready(&dh) {
                     println!("Sender done");
                     break;
@@ -209,8 +213,6 @@ mod tests {
                     for msg in msgs {
                         println!("Received: {}", msg);
                     }
-                } else {
-                    sleep_cycles(1).await;
                 }
             }
         });

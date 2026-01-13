@@ -1,12 +1,5 @@
 use std::{
-    any::Any,
-    cell::{Cell, RefCell},
-    future::Future,
-    marker::PhantomData,
-    pin::Pin,
-    rc::Rc,
-    sync::Arc,
-    task::{Context, Poll, Wake, Waker},
+    any::Any, cell::{Cell, RefCell}, future::{Future, poll_fn}, marker::PhantomData, ops::{BitAnd, BitOr, Not}, pin::Pin, rc::Rc, sync::Arc, task::{Context, Poll, Wake, Waker}
 };
 
 use slab::Slab;
@@ -31,9 +24,35 @@ struct TaskGroupShared<S> {
     // pridicates slab is expected to be small.
     predicates: Slab<PredicateEntry<S>>,
     local_states: Slab<LocalStateEntry>,
+    // should indexed with task_index, at most one pred_expr for one task
+    // we put it here for cache locality and access from DyadHandle
+    pred_exprs: Vec<Option<PredExpr>>,
     dead_predicates: Rc<RefCell<Vec<usize>>>,
     dead_local_states: Rc<RefCell<Vec<usize>>>,
     changed_local_states: Rc<RefCell<Vec<usize>>>,
+}
+
+impl<S> TaskGroupShared<S> {
+    pub fn eval_pred_expr(&self, pred_expr: &PredExpr) -> bool {
+        match pred_expr {
+            PredExpr::And(lhs, rhs) => {
+                self.eval_pred_expr(lhs) && self.eval_pred_expr(rhs)
+            }
+            PredExpr::Or(lhs, rhs) => {
+                self.eval_pred_expr(lhs) || self.eval_pred_expr(rhs)
+            }
+            PredExpr::Not(inner) => {
+                !self.eval_pred_expr(inner)
+            }
+            PredExpr::Leaf(predicate_index) => {
+                if let Some(predicate_entry) = self.predicates.get(*predicate_index) {
+                    (predicate_entry.func)(&self.state)
+                } else {
+                    false
+                }
+            }
+        }
+    }
 }
 
 impl<S: 'static> TaskGroup<S> {
@@ -47,6 +66,7 @@ impl<S: 'static> TaskGroup<S> {
                 new_tasks: Vec::new(),
                 predicates: Slab::new(),
                 local_states: Slab::new(),
+                pred_exprs: Vec::new(),
                 dead_local_states: Rc::new(RefCell::new(Vec::new())),
                 dead_predicates: Rc::new(RefCell::new(Vec::new())),
                 changed_local_states: Rc::new(RefCell::new(Vec::new())),
@@ -131,12 +151,30 @@ impl<S> TaskGroupTrait for TaskGroup<S> {
             let shared = &mut *shared_ref_mut;
 
             if shared.state_changed {
-                for (_, predicate_entry) in &shared.predicates {
-                    if predicate_entry.is_active.get() && (predicate_entry.func)(&shared.state) {
-                        shared.queue.push(predicate_entry.task_index);
-                    }
+                for (task_index, pred_expr) in shared.pred_exprs.iter().enumerate() {
+                    if let Some(pred_expr) = pred_expr {
+                        if shared.eval_pred_expr(pred_expr) {
+                            shared.queue.push(task_index);
+                        }
+                    }                    
                 }
                 shared.state_changed = false;
+            } else {
+                for local_state_index in shared.changed_local_states.borrow_mut().drain(..) {
+                    if let Some(local_state_entry) = shared.local_states.get(local_state_index) {
+                        let predicates_using = local_state_entry.predicates_using.borrow();
+                        for &predicate_index in predicates_using.iter() {
+                            if let Some(predicate_entry) = shared.predicates.get(predicate_index) {
+                                let task_index = predicate_entry.task_index;
+                                if let Some(pred_expr) = &shared.pred_exprs.get(task_index).and_then(|e| e.as_ref()) {
+                                    if shared.eval_pred_expr(pred_expr) {
+                                        shared.queue.push(task_index);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Remove predicates belonging to dead tasks
@@ -338,6 +376,30 @@ impl<'task, S: 'static> DyadHandle<'task, S> {
             modified_local_states: shared.changed_local_states.clone(),
             phantom: PhantomData,
         }
+    }
+
+    pub async fn wait_until(&mut self, pred_expr: impl Into<PredExpr>) {
+        let pred_expr = pred_expr.into();
+        let mut shared = self.task_group_shared.borrow_mut();
+        let task_index = self.task_index;
+        if shared.pred_exprs.len() <= task_index {
+            shared.pred_exprs.resize_with(task_index + 1, || None);
+        }
+        shared.pred_exprs[task_index] = Some(pred_expr);
+        drop(shared);
+        poll_fn(|_| {
+            let mut shared_ref_mut = self.task_group_shared.borrow_mut();
+            let pred_expr = shared_ref_mut.pred_exprs[task_index].as_ref().unwrap();
+            let ready = shared_ref_mut.eval_pred_expr(pred_expr);
+            if ready {
+                shared_ref_mut.pred_exprs[task_index] = None;
+                drop(shared_ref_mut);
+                Poll::Ready(())
+            } else {
+                drop(shared_ref_mut);
+                Poll::Pending
+            }
+        }).await;
     }
 }
 
@@ -657,6 +719,107 @@ impl<'a> LocalStateInPredicateBinder<'a> {
         }
     }
 }
+
+pub enum PredExpr {
+    And(Box<PredExpr>, Box<PredExpr>),
+    Or(Box<PredExpr>, Box<PredExpr>),
+    Not(Box<PredExpr>),
+    Leaf(usize),
+}
+
+impl BitAnd for PredExpr {
+    type Output = PredExpr;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        PredExpr::And(Box::new(self), Box::new(rhs))
+    }
+}
+
+impl BitAnd<&PredicateHandle<'_>> for PredExpr {
+    type Output = PredExpr;
+
+    fn bitand(self, rhs: &PredicateHandle<'_>) -> Self::Output {
+        PredExpr::And(Box::new(self), Box::new(PredExpr::Leaf(rhs.predicate_index)))
+    }
+}
+
+impl BitAnd<PredExpr> for &PredicateHandle<'_> {
+    type Output = PredExpr;
+
+    fn bitand(self, rhs: PredExpr) -> Self::Output {
+        PredExpr::And(Box::new(PredExpr::Leaf(self.predicate_index)), Box::new(rhs))
+    }
+}
+
+impl BitAnd<&PredicateHandle<'_>> for &PredicateHandle<'_> {
+    type Output = PredExpr;
+
+    fn bitand(self, rhs: &PredicateHandle<'_>) -> Self::Output {
+        PredExpr::And(
+            Box::new(PredExpr::Leaf(self.predicate_index)),
+            Box::new(PredExpr::Leaf(rhs.predicate_index)),
+        )
+    }
+}
+
+impl BitOr for PredExpr {
+    type Output = PredExpr;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        PredExpr::Or(Box::new(self), Box::new(rhs))
+    }
+}
+
+impl BitOr<&PredicateHandle<'_>> for PredExpr {
+    type Output = PredExpr;
+
+    fn bitor(self, rhs: &PredicateHandle<'_>) -> Self::Output {
+        PredExpr::Or(Box::new(self), Box::new(PredExpr::Leaf(rhs.predicate_index)))
+    }
+}
+
+impl BitOr<PredExpr> for &PredicateHandle<'_> {
+    type Output = PredExpr;
+
+    fn bitor(self, rhs: PredExpr) -> Self::Output {
+        PredExpr::Or(Box::new(PredExpr::Leaf(self.predicate_index)), Box::new(rhs))
+    }
+}
+
+impl BitOr<&PredicateHandle<'_>> for &PredicateHandle<'_> {
+    type Output = PredExpr;
+
+    fn bitor(self, rhs: &PredicateHandle<'_>) -> Self::Output {
+        PredExpr::Or(
+            Box::new(PredExpr::Leaf(self.predicate_index)),
+            Box::new(PredExpr::Leaf(rhs.predicate_index)),
+        )
+    }
+}
+
+impl Not for PredExpr {
+    type Output = PredExpr;
+
+    fn not(self) -> Self::Output {
+        PredExpr::Not(Box::new(self))
+    }
+}
+
+impl Not for &PredicateHandle<'_> {
+    type Output = PredExpr;
+
+    fn not(self) -> Self::Output {
+        PredExpr::Not(Box::new(PredExpr::Leaf(self.predicate_index)))
+    }
+}
+
+impl From<&PredicateHandle<'_>> for PredExpr {
+    fn from(handle: &PredicateHandle<'_>) -> Self {
+        PredExpr::Leaf(handle.predicate_index)
+    }
+}
+
+
 
 #[cfg(test)]
 mod tests {
