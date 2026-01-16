@@ -181,6 +181,17 @@ impl TestRuntime {
     pub fn spawn_task_group<S: 'static>(&mut self, task_group: TaskGroup<S>) {
         self.executor.add_task_group(task_group);
     }
+
+    pub fn spawn_task<Fut>(&mut self, fut: Fut)
+    where
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        let mut tg = TaskGroup::new(());
+        tg.spawn(async move |_dh| {
+            fut.await;
+        });
+        self.executor.add_task_group(tg);
+    }
 }
 
 #[cfg(test)]
