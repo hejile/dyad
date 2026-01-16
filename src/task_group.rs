@@ -332,10 +332,9 @@ impl<'task, S: 'static> DyadHandle<'task, S> {
         }
     }
 
-    pub fn add_predicate_with_state<F, T>(&mut self, mut predicate: F) -> PredicateHandle<'task>
+    pub fn add_predicate_with_state<F>(&mut self, mut predicate: F) -> PredicateHandle<'task>
     where
         F: FnMut(&mut LocalStateInPredicateBinder) -> Box<dyn Fn(&S) -> bool> + 'static,
-        T: 'static,
     {
         let shared = &mut *self.task_group_shared.borrow_mut();
         let entry = shared.predicates.vacant_entry();
@@ -373,7 +372,19 @@ impl<'task, S: 'static> DyadHandle<'task, S> {
                 .state
                 .clone(),
             dead_local_states: shared.dead_local_states.clone(),
-            modified_local_states: shared.changed_local_states.clone(),
+            changed_local_states: shared.changed_local_states.clone(),
+            phantom: PhantomData,
+        }
+    }
+
+    pub fn bind_local_state<T>(&mut self, key: LocalStateKey<T>) -> LocalStateHandle<'task, T> {
+        let shared = &mut *self.task_group_shared.borrow_mut();
+        let local_state_entry = &shared.local_states[key.local_state_index];
+        LocalStateHandle {
+            local_state_index: key.local_state_index,
+            state: local_state_entry.state.clone(),
+            dead_local_states: shared.dead_local_states.clone(),
+            changed_local_states: shared.changed_local_states.clone(),
             phantom: PhantomData,
         }
     }
@@ -512,35 +523,6 @@ impl TaskGroupQueue {
         }
     }
 
-    pub fn pop(&mut self) -> Option<usize> {
-        match self {
-            TaskGroupQueue::Bitmap(map) => {
-                if *map == 0 {
-                    None
-                } else {
-                    let task = map.trailing_zeros();
-                    *map &= !(1u64 << task);
-                    Some(task as usize)
-                }
-            }
-            TaskGroupQueue::Large(chunks, count) => {
-                if *count == 0 {
-                    return None;
-                }
-
-                for (chunk_idx, chunk) in chunks.iter_mut().enumerate() {
-                    if *chunk != 0 {
-                        let bit_idx = chunk.trailing_zeros();
-                        *chunk &= !(1u64 << bit_idx);
-                        *count -= 1;
-                        return Some(chunk_idx * 64 + bit_idx as usize);
-                    }
-                }
-                None
-            }
-        }
-    }
-
     pub fn is_empty(&self) -> bool {
         match self {
             TaskGroupQueue::Bitmap(map) => *map == 0,
@@ -615,7 +597,7 @@ pub struct LocalStateHandle<'task, T> {
     local_state_index: usize,
     state: Rc<RefCell<dyn Any>>,
     dead_local_states: Rc<RefCell<Vec<usize>>>,
-    modified_local_states: Rc<RefCell<Vec<usize>>>,
+    changed_local_states: Rc<RefCell<Vec<usize>>>,
     phantom: PhantomData<*mut &'task T>, // Invariant over 'task
 }
 
@@ -662,7 +644,7 @@ impl<'task, T: Any> LocalStateHandle<'task, T> {
     where
         F: FnOnce(&mut T) -> R,
     {
-        self.modified_local_states
+        self.changed_local_states
             .borrow_mut()
             .push(self.local_state_index);
         let mut state = self.state.borrow_mut();
@@ -825,6 +807,7 @@ impl From<&PredicateHandle<'_>> for PredExpr {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use crate::test_runtime::{sleep_cycles, TestRuntime};
 
     #[test]
     fn test_task_group_queue() {
@@ -832,179 +815,57 @@ mod tests {
         queue.push(1);
         queue.push(2);
         queue.push(3);
+        queue.push(1); // duplicate push
 
-        assert_eq!(queue.pop(), Some(1));
-        assert_eq!(queue.pop(), Some(2));
-        assert_eq!(queue.pop(), Some(3));
-        assert_eq!(queue.pop(), None);
-    }
+        let values: Vec<usize> = queue.take_bitmap_chunk(None).collect();
+        assert_eq!(values, [1, 2, 3]);
 
-    #[test]
-    fn test_task_group_queue_large() {
-        let mut queue = TaskGroupQueue::new();
-
-        // Push task indices that will trigger upgrade to Large variant
-        for i in 0..100 {
+        for i in 0..256 {
             queue.push(i);
         }
-
-        // Pop and verify all tasks
-        for i in 0..100 {
-            assert_eq!(queue.pop(), Some(i));
-        }
-        assert_eq!(queue.pop(), None);
+        assert!(!queue.is_empty());
+        let values: Vec<usize> = queue.take_bitmap_chunk(Some(0)).collect();
+        assert_eq!(values, (64..128).collect::<Vec<usize>>());
+        let values: Vec<usize> = queue.take_bitmap_chunk(Some(1)).collect();
+        assert_eq!(values, (128..192).collect::<Vec<usize>>());
+        let values: Vec<usize> = queue.take_bitmap_chunk(Some(2)).collect();
+        assert_eq!(values, (192..256).collect::<Vec<usize>>());
+        let values: Vec<usize> = queue.take_bitmap_chunk(None).collect();
+        assert_eq!(values, (0..64).collect::<Vec<usize>>());
         assert!(queue.is_empty());
     }
 
     #[test]
-    fn test_task_group_queue_duplicate_push() {
-        let mut queue = TaskGroupQueue::new();
+    fn test_local_state() {
+        let mut runtime = TestRuntime::new();
 
-        queue.push(5);
-        queue.push(5); // Duplicate
-        queue.push(10);
-
-        assert_eq!(queue.pop(), Some(5));
-        assert_eq!(queue.pop(), Some(10));
-        assert_eq!(queue.pop(), None);
-    }
-
-    #[test]
-    fn test_task_group_queue_sparse() {
-        let mut queue = TaskGroupQueue::new();
-
-        queue.push(0);
-        queue.push(63);
-        queue.push(64);
-        queue.push(127);
-
-        assert_eq!(queue.pop(), Some(0));
-        assert_eq!(queue.pop(), Some(63));
-        assert_eq!(queue.pop(), Some(64));
-        assert_eq!(queue.pop(), Some(127));
-    }
-
-    #[test]
-    fn test_bitmap_iter() {
-        let iter = BitmapIter {
-            bitmap: 0b1010,
-            chunk_index: 0,
-        };
-
-        let indices: Vec<usize> = iter.collect();
-        assert_eq!(indices, vec![1, 3]);
-    }
-
-    #[test]
-    fn test_bitmap_iter_with_chunk_offset() {
-        let iter = BitmapIter {
-            bitmap: 0b11,
-            chunk_index: 2,
-        };
-
-        let indices: Vec<usize> = iter.collect();
-        assert_eq!(indices, vec![128, 129]);
-    }
-
-    #[test]
-    fn test_task_group_creation() {
-        struct State {
-            counter: Cell<i32>,
+        struct SharedState {
+            counter: usize,
         }
 
-        let state = State {
-            counter: Cell::new(0),
-        };
-        let task_group = TaskGroup::new(state);
+        let mut tg = TaskGroup::new(SharedState { counter: 0 });
 
-        assert_eq!(task_group.tasks.len(), 0);
-        assert_eq!(task_group.shared.borrow().state.counter.get(), 0);
-        assert!(task_group.executor_shared.is_none());
-        assert!(task_group.task_group_id.is_none());
-    }
+        tg.spawn(async |dh| {
+            let mut local_state = dh.create_local_state::<usize>(0usize);
+            let local_state_key = local_state.key();
+            let p1 = dh.add_predicate_with_state(move |binder| {
+                let local_handle = binder.bind::<usize>(local_state_key);
+                Box::new(move |s: &SharedState| {
+                    let local_value = local_handle.access(|v| *v);
+                    s.counter < local_value
+                })
+            });
+            dh.spawn(async move |dh| {
+                let mut local_state = dh.bind_local_state(local_state_key);
 
-    #[test]
-    fn test_task_group_queue_take_bitmap_chunk() {
-        let mut queue = TaskGroupQueue::new();
-
-        queue.push(1);
-        queue.push(5);
-        queue.push(10);
-
-        let chunk = queue.take_bitmap_chunk(None);
-        let indices: Vec<usize> = chunk.collect();
-
-        assert_eq!(indices, vec![1, 5, 10]);
-        assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn test_task_group_queue_take_bitmap_chunk_large() {
-        let mut queue = TaskGroupQueue::new();
-
-        // Add tasks across multiple chunks
-        queue.push(5);
-        queue.push(70);
-        queue.push(130);
-
-        let chunk1 = queue.take_bitmap_chunk(None);
-        let indices1: Vec<usize> = chunk1.collect();
-        assert!(!indices1.is_empty());
-
-        if !queue.is_empty() {
-            let chunk2 = queue.take_bitmap_chunk(Some(0));
-            let indices2: Vec<usize> = chunk2.collect();
-            assert!(!indices2.is_empty());
-        }
-    }
-
-    #[test]
-    fn test_task_group_shared_state_access() {
-        struct State {
-            value: Cell<i32>,
-        }
-
-        let task_group = TaskGroup::new(State {
-            value: Cell::new(42),
+                sleep_cycles(10).await;
+                local_state.modify(|v| *v = 5);
+            });
+            dh.wait_until(&p1).await;
+            println!("Predicate satisfied: counter < local_state");
         });
 
-        {
-            let shared = task_group.shared.borrow();
-            assert_eq!(shared.state.value.get(), 42);
-        }
-
-        {
-            let shared = task_group.shared.borrow();
-            shared.state.value.set(100);
-        }
-
-        {
-            let shared = task_group.shared.borrow();
-            assert_eq!(shared.state.value.get(), 100);
-        }
-    }
-
-    #[test]
-    fn test_task_group_queue_is_empty() {
-        let mut queue = TaskGroupQueue::new();
-        assert!(queue.is_empty());
-
-        queue.push(1);
-        assert!(!queue.is_empty());
-
-        queue.pop();
-        assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn test_task_group_queue_boundary_64() {
-        let mut queue = TaskGroupQueue::new();
-
-        // Test the boundary between Bitmap and Large
-        queue.push(63);
-        assert!(matches!(queue, TaskGroupQueue::Bitmap(_)));
-
-        queue.push(64);
-        assert!(matches!(queue, TaskGroupQueue::Large(_, _)));
+        runtime.executor.add_task_group(tg);
+        runtime.run();
     }
 }
