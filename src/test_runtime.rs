@@ -1,4 +1,5 @@
 use crate::executor::Executor;
+use crate::task_group::TaskGroup;
 use std::cell::RefCell;
 use std::collections::BinaryHeap;
 use std::cmp::Ordering;
@@ -6,6 +7,16 @@ use std::task::Waker;
 
 thread_local! {
     static TEST_RUNTIME_CONTEXT: RefCell<Option<TestRuntimeContext>> = RefCell::new(None);
+}
+
+pub fn test(f: impl Future<Output = ()> + 'static) {
+    let mut runtime = TestRuntime::new();
+    let mut task_group = TaskGroup::new(());
+    task_group.spawn(async move |_dh| {
+        f.await;
+    });
+    runtime.spawn_task_group(task_group);
+    runtime.run();
 }
 
 struct SleepEntry {
@@ -111,7 +122,8 @@ pub async fn sleep_cycles(cycles: u64) {
 }
 
 pub struct TestRuntime {
-    executor: Executor,
+    pub executor: Executor,
+    context: Option<TestRuntimeContext>,
 }
 
 impl TestRuntime {
@@ -119,7 +131,10 @@ impl TestRuntime {
         let executor = Executor::new(|| {
             // No-op notifier for test runtime
         });
-        TestRuntime { executor }
+        TestRuntime {
+            executor,
+            context: Some(TestRuntimeContext::new())
+        }
     }
 
     pub fn run(&mut self) {
@@ -129,7 +144,7 @@ impl TestRuntime {
     pub fn run_cycles(&mut self, cycles: u64) {
         let old_value = TEST_RUNTIME_CONTEXT.with(|ctx| {
             let old = ctx.borrow_mut().take();
-            *ctx.borrow_mut() = Some(TestRuntimeContext::new());
+            *ctx.borrow_mut() = self.context.take();
             old
         });
 
@@ -142,6 +157,7 @@ impl TestRuntime {
         }
 
         TEST_RUNTIME_CONTEXT.with(|ctx| {
+            self.context = ctx.borrow_mut().take();
             *ctx.borrow_mut() = old_value;
         });
     }
@@ -161,13 +177,15 @@ impl TestRuntime {
         });
         self.executor.run();
     }
+
+    pub fn spawn_task_group<S: 'static>(&mut self, task_group: TaskGroup<S>) {
+        self.executor.add_task_group(task_group);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
     use crate::task_group::TaskGroup;
 
     #[test]
@@ -223,5 +241,14 @@ mod tests {
             runtime.executor.is_empty(),
             "Test runtime did not complete in expected cycles"
         );
+    }
+
+    #[test]
+    fn test_test() {
+        test(async {
+            println!("Hello from test runtime!");
+            sleep_cycles(2).await;
+            println!("Woke up after 2 cycles!");
+        });
     }
 }
