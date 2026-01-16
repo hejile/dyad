@@ -55,15 +55,12 @@ impl Executor {
             }
 
             if waked_task_groups.is_empty() {
-                // 进入“空闲”前，先清掉 notifed；然后立刻二次确认队列，避免并发 push 导致丢通知
                 self.shared.notifier.notifed.store(false, Ordering::Release);
 
                 if self.shared.queue.is_empty() {
                     break;
                 }
 
-                // 队列里已经有新东西（可能是在 notifed=true 时 push 的），继续跑
-                // （可选）把 notifed 置回 true，避免别的线程在我们继续运行期间反复触发外部 notifier
                 self.shared.notifier.notifed.store(true, Ordering::Release);
                 continue;
             }
