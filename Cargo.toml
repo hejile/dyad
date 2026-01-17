@@ -2,6 +2,13 @@
 name = "dyad"
 version = "0.0.1"
 edition = "2024"
+authors = ["hejile"]
+description = "A lightweight asynchronous task executor with TaskGroup as core abstraction for task management."
+license = "MIT"
+repository = "https://github.com/hejile/dyad"
+readme = "README.md"
+keywords = ["async", "executor", "task", "taskgroup", "concurrency"]
+categories = ["asynchronous", "concurrency"]
 
 [dependencies]
 concurrent-queue = "2.5.0"
