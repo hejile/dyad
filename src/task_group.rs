@@ -1,6 +1,12 @@
-use std::{
-    any::Any, cell::{Cell, RefCell}, future::{Future, poll_fn}, marker::PhantomData, ops::{BitAnd, BitOr, Not}, pin::Pin, rc::Rc, sync::Arc, task::{Context, Poll, Wake, Waker}
-};
+use std::any::Any;
+use std::cell::{Cell, RefCell};
+use std::future::{Future, poll_fn};
+use std::marker::PhantomData;
+use std::ops::{BitAnd, BitOr, Not};
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
 
 use slab::Slab;
 
@@ -264,12 +270,6 @@ pub(crate) type UntypedTaskGroup = Box<dyn TaskGroupTrait>;
 
 pub struct TaskGroupHandle {
     phantom: PhantomData<*mut ()>,
-}
-
-trait IntoTaskGroup {
-    type Handle;
-    fn into_task_group(self) -> impl TaskGroupTrait;
-    fn new_handle(task_group_handle: TaskGroupHandle) -> Self::Handle;
 }
 
 /// Handle passed into tasks to interact with the task group
@@ -806,7 +806,6 @@ impl From<&PredicateHandle<'_>> for PredExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use crate::test_runtime::{sleep_cycles, TestRuntime};
 
     #[test]
@@ -846,7 +845,7 @@ mod tests {
         let mut tg = TaskGroup::new(SharedState { counter: 0 });
 
         tg.spawn(async |dh| {
-            let mut local_state = dh.create_local_state::<usize>(0usize);
+            let local_state = dh.create_local_state::<usize>(0usize);
             let local_state_key = local_state.key();
             let p1 = dh.add_predicate_with_state(move |binder| {
                 let local_handle = binder.bind::<usize>(local_state_key);

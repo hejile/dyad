@@ -1,12 +1,9 @@
-use core::task;
-use std::{
-    cell::{Cell, RefCell, UnsafeCell}, future, marker::PhantomData, pin::Pin, rc::Rc, sync::{Arc, atomic::AtomicBool}, task::{Poll, Wake, Waker}
-};
+use std::sync::{Arc, atomic::AtomicBool};
 
 use concurrent_queue::ConcurrentQueue;
 use slab::Slab;
 
-use crate::task_group::{self, Task, TaskGroup, UntypedTaskGroup};
+use crate::task_group::{TaskGroup, UntypedTaskGroup};
 
 pub struct Executor {
     task_groups: Slab<TaskGroupEntry>,
@@ -24,7 +21,7 @@ impl Executor {
         }
     }
 
-    pub fn add_task_group<S>(&mut self, mut task_group: TaskGroup<S>) -> usize
+    pub fn add_task_group<S>(&mut self, task_group: TaskGroup<S>) -> usize
     where
         S: 'static,
     {
