@@ -9,6 +9,11 @@ repository = "https://github.com/hejile/dyad"
 readme = "README.md"
 keywords = ["async", "executor", "task", "taskgroup", "concurrency"]
 categories = ["asynchronous", "concurrency"]
+exclude = [
+    ".github/",
+    ".gitignore",
+    "Cargo.lock",
+]
 
 [dependencies]
 concurrent-queue = "2.5.0"
