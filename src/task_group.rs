@@ -82,7 +82,9 @@ impl<S: 'static> TaskGroup<S> {
         }
     }
 
-    pub fn spawn<F>(&mut self, task: F)
+    /// Spawns a task and returns its ID within this group.
+    /// The ID remains valid while the task is alive and may be reused after completion.
+    pub fn spawn<F>(&mut self, task: F) -> usize
     where
         F: for<'a> AsyncFnOnce(&'a mut DyadHandle<S>) + 'static,
     {
@@ -113,6 +115,7 @@ impl<S: 'static> TaskGroup<S> {
             Waker::noop().clone()
         };
         entry.insert(TaskEntry { task, waker });
+        task_index
     }
 }
 
@@ -807,6 +810,37 @@ impl From<&PredicateHandle<'_>> for PredExpr {
 mod tests {
     use super::*;
     use crate::test_runtime::{sleep_cycles, TestRuntime};
+
+    #[test]
+    fn spawn_returns_the_id_used_for_scheduling() {
+        let mut group = TaskGroup::new(());
+        let first_polls = Rc::new(Cell::new(0));
+        let second_polls = Rc::new(Cell::new(0));
+        let first_counter = first_polls.clone();
+        let first = group.spawn(async move |_| {
+            poll_fn(|_| {
+                first_counter.set(first_counter.get() + 1);
+                Poll::<()>::Pending
+            }).await;
+        });
+        let second_counter = second_polls.clone();
+        let second = group.spawn(async move |_| {
+            poll_fn(|_| {
+                second_counter.set(second_counter.get() + 1);
+                Poll::<()>::Pending
+            }).await;
+        });
+        assert_ne!(first, second);
+        group.wake_task(second);
+        group.schedule();
+        assert_eq!(first_polls.get(), 0);
+        assert_eq!(second_polls.get(), 1);
+        group.wake_task(first);
+        group.schedule();
+        assert_eq!(first_polls.get(), 1);
+        assert_eq!(second_polls.get(), 1);
+        assert!(group.is_live());
+    }
 
     #[test]
     fn test_task_group_queue() {
