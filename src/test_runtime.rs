@@ -11,7 +11,7 @@ thread_local! {
 
 pub fn test(f: impl Future<Output = ()> + 'static) {
     let mut runtime = TestRuntime::new();
-    let mut task_group = TaskGroup::new(());
+    let mut task_group = TaskGroup::new_without_context(());
     task_group.spawn(async move |_dh| {
         f.await;
     });
@@ -178,7 +178,7 @@ impl TestRuntime {
         self.executor.run();
     }
 
-    pub fn spawn_task_group<S: 'static>(&mut self, task_group: TaskGroup<S>) {
+    pub fn spawn_task_group<S: 'static, C: 'static>(&mut self, task_group: TaskGroup<S, C>) {
         self.executor.add_task_group(task_group);
     }
 
@@ -186,7 +186,7 @@ impl TestRuntime {
     where
         Fut: std::future::Future<Output = ()> + 'static,
     {
-        let mut tg = TaskGroup::new(());
+        let mut tg = TaskGroup::new_without_context(());
         tg.spawn(async move |_dh| {
             fut.await;
         });
@@ -208,7 +208,7 @@ mod tests {
             sender_done: bool,
         }
 
-        let mut tg = TaskGroup::new(SharedState {
+        let mut tg = TaskGroup::new_without_context(SharedState {
             msgs: Vec::new(),
             sender_done: false,
         });

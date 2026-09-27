@@ -21,13 +21,17 @@ impl Executor {
         }
     }
 
-    pub fn add_task_group<S>(&mut self, task_group: TaskGroup<S>) -> usize
+    pub fn add_task_group<S, C>(&mut self, task_group: TaskGroup<S, C>) -> usize
     where
         S: 'static,
+        C: 'static,
     {
+        self.add_task_group_inner(Box::new(task_group))
+    }
+
+    fn add_task_group_inner(&mut self, mut task_group: UntypedTaskGroup) -> usize{
         let slab_entry = self.task_groups.vacant_entry();
         let task_group_index = slab_entry.key();
-        let mut task_group: UntypedTaskGroup = Box::new(task_group);
         task_group.attached_to_executor(self.shared.clone(), task_group_index);
 
         let entry = TaskGroupEntry {
@@ -65,9 +69,14 @@ impl Executor {
             for task_group_index in waked_task_groups.drain(..) {
                 let entry = &mut self.task_groups[task_group_index];
                 entry.task_group.schedule();
+                
+                let new_task_groups = entry.task_group.take_new_task_groups();
                 if !entry.task_group.is_live() {
                     self.task_groups.remove(task_group_index);
                 }
+                for new_task_group in new_task_groups {
+                    self.add_task_group_inner(new_task_group);
+                };
             }
         }
     }
