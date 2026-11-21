@@ -126,7 +126,7 @@ impl<S: 'static, C: 'static> TaskGroup<S, C> {
 
 impl<S: 'static> TaskGroup<S, ()> {
     pub fn new_without_context(s: S) -> Self {
-        Self::new(s, DyadContext::new(Rc::new(RefCell::new(()))))
+        Self::new(s, DyadContext::default())
     }
 }
 
@@ -302,6 +302,11 @@ pub struct DyadHandle<'task, S, C> {
 impl<'task, S: 'static, C: 'static> DyadHandle<'task, S, C> {
     pub fn spawn_task_group<S1: 'static>(&mut self, f: impl FnOnce(DyadContext<C>) -> TaskGroup<S1, C>) {
         let new_tg = f(self.task_group_shared.borrow().context.clone());
+        self.task_group_shared.borrow_mut().new_task_groups.push(Box::new(new_tg));
+    }
+
+    pub fn spawn_task_group_with_context<S1: 'static, NC: 'static>(&mut self, c: &DyadContext<NC>,  f: impl FnOnce(DyadContext<NC>) -> TaskGroup<S1, NC>) {
+        let new_tg = f(c.clone());
         self.task_group_shared.borrow_mut().new_task_groups.push(Box::new(new_tg));
     }
 

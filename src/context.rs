@@ -5,9 +5,9 @@ pub struct DyadContext<C> {
 }
 
 impl<C> DyadContext<C> {
-    pub fn new(data: Rc<RefCell<C>>) -> Self {
+    pub fn new(data: C) -> Self {
         Self {
-            data,
+            data: Rc::new(RefCell::new(data)),
         }
     }
     pub fn with<R>(&self, f: impl FnOnce(&C) -> R) -> R {
@@ -24,11 +24,8 @@ impl<C> Clone for DyadContext<C> {
     }
 }
 
-struct ContextMetadata {
-    
-}
-
-struct ContextHandle<C> {
-    data: Rc<RefCell<C>>,
-
+impl<C: Default> Default for DyadContext<C> {
+    fn default() -> Self {
+        Self::new(Default::default())
+    }
 }
