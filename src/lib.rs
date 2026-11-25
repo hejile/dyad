@@ -1,5 +1,8 @@
-pub mod context;
+mod context;
 pub mod executor;
 pub mod ov;
-pub mod task_group;
+mod task_group;
 pub mod test_runtime;
+
+pub use task_group::{IntoTaskGroup, DyadSpawner, DyadHandle};
+pub use context::{ParentContextHolder, ChildDyadContext};

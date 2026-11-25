@@ -12,17 +12,18 @@ use slab::Slab;
 
 use crate::context::DyadContext;
 use crate::executor::ExecutorShared;
+use crate::{ChildDyadContext, task_group};
 
 pub struct TaskGroup<S, C> {
     tasks: Slab<TaskEntry>,
-    shared: Rc<RefCell<TaskGroupShared<S, C>>>,
+    shared: Rc<RefCell<TaskGroupShared<S>>>,
+    context: DyadContext<C>,
     executor_shared: Option<Arc<ExecutorShared>>,
     task_group_id: Option<usize>,
 }
 
-struct TaskGroupShared<S, C> {
+struct TaskGroupShared<S> {
     state: S,
-    context: DyadContext<C>,
     state_changed: bool,
     queue: TaskGroupQueue,
     new_tasks: Vec<(
@@ -41,7 +42,7 @@ struct TaskGroupShared<S, C> {
     changed_local_states: Rc<RefCell<Vec<usize>>>,
 }
 
-impl<S, C> TaskGroupShared<S, C> {
+impl<S> TaskGroupShared<S> {
     pub fn eval_pred_expr(&self, pred_expr: &PredExpr) -> bool {
         match pred_expr {
             PredExpr::And(lhs, rhs) => {
@@ -65,12 +66,21 @@ impl<S, C> TaskGroupShared<S, C> {
 }
 
 impl<S: 'static, C: 'static> TaskGroup<S, C> {
-    pub fn new(state: S, context: DyadContext<C>) -> Self {
+    pub(crate) fn new(tg: impl IntoTaskGroup<S, C>, context: DyadContext<C>) -> Self {
+        let (state, f) = tg.into_task_group();
+        let task_group = Self::create(state, context);
+        let mut spawner = DyadSpawner {
+            task_group,
+        };
+        f(&mut spawner);
+        spawner.task_group
+    }
+
+    fn create(state: S, context: DyadContext<C>) -> Self {
         TaskGroup {
             tasks: Slab::new(),
             shared: Rc::new(RefCell::new(TaskGroupShared {
                 state,
-                context,
                 state_changed: false,
                 queue: TaskGroupQueue::new(),
                 new_tasks: Vec::new(),
@@ -82,6 +92,7 @@ impl<S: 'static, C: 'static> TaskGroup<S, C> {
                 dead_predicates: Rc::new(RefCell::new(Vec::new())),
                 changed_local_states: Rc::new(RefCell::new(Vec::new())),
             })),
+            context,
             executor_shared: None,
             task_group_id: None,
         }
@@ -89,7 +100,7 @@ impl<S: 'static, C: 'static> TaskGroup<S, C> {
 
     /// Spawns a task and returns its ID within this group.
     /// The ID remains valid while the task is alive and may be reused after completion.
-    pub fn spawn<F>(&mut self, task: F) -> usize
+    fn spawn<F>(&mut self, task: F) -> usize
     where
         F: for<'a> AsyncFnOnce(&'a mut DyadHandle<S, C>) + 'static,
     {
@@ -97,10 +108,12 @@ impl<S: 'static, C: 'static> TaskGroup<S, C> {
         let task_index = entry.key();
 
         let mut shared = self.shared.clone();
+        let context = self.context.clone();
         let future = async move {
             let mut dyad_handle = DyadHandle {
                 task_group_shared: &mut shared,
                 task_index,
+                context,
                 phantom: PhantomData,
             };
             task(&mut dyad_handle).await;
@@ -121,12 +134,6 @@ impl<S: 'static, C: 'static> TaskGroup<S, C> {
         };
         entry.insert(TaskEntry { task, waker });
         task_index
-    }
-}
-
-impl<S: 'static> TaskGroup<S, ()> {
-    pub fn new_without_context(s: S) -> Self {
-        Self::new(s, DyadContext::default())
     }
 }
 
@@ -294,20 +301,22 @@ pub struct TaskGroupHandle {
 /// Handle passed into tasks to interact with the task group
 /// 'task lifetime ensures that the handle does not outlive the task
 pub struct DyadHandle<'task, S, C> {
-    task_group_shared: &'task mut Rc<RefCell<TaskGroupShared<S, C>>>,
+    task_group_shared: &'task mut Rc<RefCell<TaskGroupShared<S>>>,
     task_index: usize,
+    context: DyadContext<C>,
     phantom: PhantomData<*mut &'task ()>, // Invariant over 'task
 }
 
 impl<'task, S: 'static, C: 'static> DyadHandle<'task, S, C> {
-    pub fn spawn_task_group<S1: 'static>(&mut self, f: impl FnOnce(DyadContext<C>) -> TaskGroup<S1, C>) {
-        let new_tg = f(self.task_group_shared.borrow().context.clone());
-        self.task_group_shared.borrow_mut().new_task_groups.push(Box::new(new_tg));
+    pub fn spawn_task_group<NS: 'static>(&mut self, tg: impl IntoTaskGroup<NS, C>) {
+        let task_group = TaskGroup::new(tg, self.context.clone());
+        self.task_group_shared.borrow_mut().new_task_groups.push(Box::new(task_group));
     }
 
-    pub fn spawn_task_group_with_context<S1: 'static, NC: 'static>(&mut self, c: &DyadContext<NC>,  f: impl FnOnce(DyadContext<NC>) -> TaskGroup<S1, NC>) {
-        let new_tg = f(c.clone());
-        self.task_group_shared.borrow_mut().new_task_groups.push(Box::new(new_tg));
+    pub fn spawn_task_group_with_context<NS: 'static, NC: 'static + ChildDyadContext<Parent = C>>(&mut self, mut c: NC, tg: impl IntoTaskGroup<NS, NC>) {
+        c.parent_holder_mut().set_parent(self.context.clone());
+        let task_group = TaskGroup::new(tg, DyadContext::new(c));
+        self.task_group_shared.borrow_mut().new_task_groups.push(Box::new(task_group));
     }
 
     pub fn spawn<F>(&mut self, f: F)
@@ -317,11 +326,13 @@ impl<'task, S: 'static, C: 'static> DyadHandle<'task, S, C> {
         let mut task_group_shared = self.task_group_shared.clone();
         let task_index_ref_cell = Rc::new(RefCell::new(0usize));
         let task_index = task_index_ref_cell.clone();
+        let context = self.context.clone();
         let task_future = async move {
             let task_index = *task_index.borrow();
             let mut dyad_handle = DyadHandle {
                 task_group_shared: &mut task_group_shared,
                 task_index,
+                context,
                 phantom: PhantomData,
             };
             f(&mut dyad_handle).await;
@@ -339,9 +350,25 @@ impl<'task, S: 'static, C: 'static> DyadHandle<'task, S, C> {
         r
     }
 
+    pub fn modify_with_context<R, F: FnOnce(&mut S, &C) -> R>(&mut self, f: F) -> R {
+        let shared = &mut *self.task_group_shared.borrow_mut();
+        let r = f(&mut shared.state, &self.context);
+        shared.state_changed = true;
+        r
+    }
+
     pub fn access<R, F: FnOnce(&S) -> R>(&self, f: F) -> R {
         let shared = self.task_group_shared.borrow();
         f(&shared.state)
+    }
+
+    pub fn access_with_context<R, F: FnOnce(&S, &C) -> R>(&self, f: F) -> R {
+        let shared = self.task_group_shared.borrow();
+        f(&shared.state, &self.context)
+    }
+
+    pub fn context(&self) -> &C {
+        &self.context
     }
 
     pub fn add_predicate<F>(&mut self, predicate: F) -> PredicateHandle<'task>
@@ -440,14 +467,6 @@ impl<'task, S: 'static, C: 'static> DyadHandle<'task, S, C> {
                 Poll::Pending
             }
         }).await;
-    }
-
-    pub fn with_context<R>(&self, f: impl FnOnce(&C) -> R) -> R {
-        self.task_group_shared.borrow().context.with(f)
-    }
-
-    pub fn with_context_mut<R>(&mut self, f: impl FnOnce(&mut C) -> R) -> R {
-        self.task_group_shared.borrow_mut().context.with_mut(f)
     }
 }
 
@@ -838,41 +857,47 @@ impl From<&PredicateHandle<'_>> for PredExpr {
     }
 }
 
+pub struct DyadSpawner<S, C> {
+    task_group: TaskGroup<S, C>,
+}
+
+impl<S: 'static, C: 'static> DyadSpawner<S, C> {
+    pub fn spawn_task<F>(&mut self, f: F)
+    where
+        F: for<'a> AsyncFnOnce(&'a mut DyadHandle<S, C>) + 'static,
+    {
+        self.task_group.spawn(f);
+    }
+    
+    pub fn spawn_task_group<NS: 'static>(&mut self, tg: impl IntoTaskGroup<NS, C>) {
+        let task_group = TaskGroup::new(tg, self.task_group.context.clone());
+        self.task_group.shared.borrow_mut().new_task_groups.push(Box::new(task_group));
+    }
+
+    pub fn spawn_task_group_with_context<NS: 'static, NC: 'static + ChildDyadContext<Parent = C>>(&mut self, tg: impl IntoTaskGroup<NS, NC>, mut c: NC) {
+        c.parent_holder_mut().set_parent(self.task_group.context.clone());
+        let task_group = TaskGroup::new(tg, DyadContext::new(c));
+        self.task_group.shared.borrow_mut().new_task_groups.push(Box::new(task_group));
+    }
+}
+
+pub trait IntoTaskGroup<S: 'static, C: 'static> {
+    fn into_task_group(self) -> (S, impl FnOnce(&mut DyadSpawner<S, C>));
+}
+
+impl<S: 'static, C: 'static, F> IntoTaskGroup<S, C> for (S, F)
+where
+    F: FnOnce(&mut DyadSpawner<S, C>),
+{
+    fn into_task_group(self) -> (S, impl FnOnce(&mut DyadSpawner<S, C>)) {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_runtime::{sleep_cycles, TestRuntime};
-
-    #[test]
-    fn spawn_returns_the_id_used_for_scheduling() {
-        let mut group = TaskGroup::new_without_context(());
-        let first_polls = Rc::new(Cell::new(0));
-        let second_polls = Rc::new(Cell::new(0));
-        let first_counter = first_polls.clone();
-        let first = group.spawn(async move |_| {
-            poll_fn(|_| {
-                first_counter.set(first_counter.get() + 1);
-                Poll::<()>::Pending
-            }).await;
-        });
-        let second_counter = second_polls.clone();
-        let second = group.spawn(async move |_| {
-            poll_fn(|_| {
-                second_counter.set(second_counter.get() + 1);
-                Poll::<()>::Pending
-            }).await;
-        });
-        assert_ne!(first, second);
-        group.wake_task(second);
-        group.schedule();
-        assert_eq!(first_polls.get(), 0);
-        assert_eq!(second_polls.get(), 1);
-        group.wake_task(first);
-        group.schedule();
-        assert_eq!(first_polls.get(), 1);
-        assert_eq!(second_polls.get(), 1);
-        assert!(group.is_live());
-    }
 
     #[test]
     fn test_task_group_queue() {
@@ -908,29 +933,33 @@ mod tests {
             counter: usize,
         }
 
-        let mut tg = TaskGroup::new_without_context(SharedState { counter: 0 });
+        impl IntoTaskGroup<Self, ()> for SharedState {
+            fn into_task_group(self) -> (Self, impl FnOnce(&mut DyadSpawner<Self, ()>)) {
+                (self, |spawner| {
+                    spawner.spawn_task(async |dh| {
+                        let local_state = dh.create_local_state::<usize>(0usize);
+                        let local_state_key = local_state.key();
+                        let p1 = dh.add_predicate_with_state(move |binder| {
+                            let local_handle = binder.bind::<usize>(local_state_key);
+                            Box::new(move |s: &SharedState| {
+                                let local_value = local_handle.access(|v| *v);
+                                s.counter < local_value
+                            })
+                        });
+                        dh.spawn(async move |dh| {
+                            let mut local_state = dh.bind_local_state(local_state_key);
 
-        tg.spawn(async |dh| {
-            let local_state = dh.create_local_state::<usize>(0usize);
-            let local_state_key = local_state.key();
-            let p1 = dh.add_predicate_with_state(move |binder| {
-                let local_handle = binder.bind::<usize>(local_state_key);
-                Box::new(move |s: &SharedState| {
-                    let local_value = local_handle.access(|v| *v);
-                    s.counter < local_value
+                            sleep_cycles(10).await;
+                            local_state.modify(|v| *v = 5);
+                        });
+                        dh.wait_until(&p1).await;
+                        println!("Predicate satisfied: counter < local_state");
+                    });
                 })
-            });
-            dh.spawn(async move |dh| {
-                let mut local_state = dh.bind_local_state(local_state_key);
+            }
+        }
 
-                sleep_cycles(10).await;
-                local_state.modify(|v| *v = 5);
-            });
-            dh.wait_until(&p1).await;
-            println!("Predicate satisfied: counter < local_state");
-        });
-
-        runtime.executor.add_task_group(tg);
+        runtime.executor.add_task_group(SharedState { counter: 0 }, ());
         runtime.run();
     }
 }

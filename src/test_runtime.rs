@@ -1,3 +1,4 @@
+use crate::{IntoTaskGroup, DyadSpawner};
 use crate::executor::Executor;
 use crate::task_group::TaskGroup;
 use std::cell::RefCell;
@@ -11,11 +12,7 @@ thread_local! {
 
 pub fn test(f: impl Future<Output = ()> + 'static) {
     let mut runtime = TestRuntime::new();
-    let mut task_group = TaskGroup::new_without_context(());
-    task_group.spawn(async move |_dh| {
-        f.await;
-    });
-    runtime.spawn_task_group(task_group);
+    runtime.spawn_task(f);
     runtime.run();
 }
 
@@ -178,19 +175,20 @@ impl TestRuntime {
         self.executor.run();
     }
 
-    pub fn spawn_task_group<S: 'static, C: 'static>(&mut self, task_group: TaskGroup<S, C>) {
-        self.executor.add_task_group(task_group);
+    pub fn spawn_task_group<S: 'static, C: 'static>(&mut self, task_group: impl IntoTaskGroup<S, C>, context: C) {
+        self.executor.add_task_group(task_group, context);
     }
 
     pub fn spawn_task<Fut>(&mut self, fut: Fut)
     where
         Fut: std::future::Future<Output = ()> + 'static,
     {
-        let mut tg = TaskGroup::new_without_context(());
-        tg.spawn(async move |_dh| {
-            fut.await;
+        let tg = ((), move |spanwer: &mut DyadSpawner<(), ()>| {
+            spanwer.spawn_task(async move |_| {
+                fut.await;
+            });
         });
-        self.executor.add_task_group(tg);
+        self.executor.add_task_group(tg, ());
     }
 }
 
@@ -208,45 +206,53 @@ mod tests {
             sender_done: bool,
         }
 
-        let mut tg = TaskGroup::new_without_context(SharedState {
+        impl IntoTaskGroup<Self, ()> for SharedState {
+            fn into_task_group(self) -> (Self, impl FnOnce(&mut DyadSpawner<Self, ()>)) {
+                (self, |spawner| {
+                    spawner.spawn_task(async |dh| {
+                        for i in 0..5 {
+                            dh.modify(|s| {
+                                s.msgs.push(format!("count {}", i));
+                            });
+                            sleep_cycles(3).await;
+                        }
+                        dh.modify(|s| {
+                            s.sender_done = true;
+                        });
+                    });
+
+                    spawner.spawn_task(async |dh| {
+                        let msg_available = dh.add_predicate(|s| !s.msgs.is_empty());
+                        let sender_done = dh.add_predicate(|s| s.sender_done);
+
+                        let mut count = 0;
+                        loop {
+                            count += 1;
+                            println!("receiver waiting at iteration {}", count);
+                            dh.wait_until(&msg_available | &sender_done).await;
+                            if sender_done.is_ready(&dh) {
+                                println!("Sender done");
+                                break;
+                            }
+                            if msg_available.is_ready(&dh) {
+                                let msgs = dh.modify(|s| std::mem::take(&mut s.msgs));
+                                for msg in msgs {
+                                    println!("Received: {}", msg);
+                                }
+                            }
+                        }
+                    });
+                })
+            }
+        }
+
+        let tg = SharedState {
             msgs: Vec::new(),
             sender_done: false,
-        });
-        tg.spawn(async |dh| {
-            for i in 0..5 {
-                dh.modify(|s| {
-                    s.msgs.push(format!("count {}", i));
-                });
-                sleep_cycles(3).await;
-            }
-            dh.modify(|s| {
-                s.sender_done = true;
-            });
-        });
+        };
 
-        tg.spawn(async |dh| {
-            let msg_available = dh.add_predicate(|s| !s.msgs.is_empty());
-            let sender_done = dh.add_predicate(|s| s.sender_done);
 
-            let mut count = 0;
-            loop {
-                count += 1;
-                println!("receiver waiting at iteration {}", count);
-                dh.wait_until(&msg_available | &sender_done).await;
-                if sender_done.is_ready(&dh) {
-                    println!("Sender done");
-                    break;
-                }
-                if msg_available.is_ready(&dh) {
-                    let msgs = dh.modify(|s| std::mem::take(&mut s.msgs));
-                    for msg in msgs {
-                        println!("Received: {}", msg);
-                    }
-                }
-            }
-        });
-
-        runtime.executor.add_task_group(tg);
+        runtime.executor.add_task_group(tg, ());
         runtime.run_cycles(20);
         assert!(
             runtime.executor.is_empty(),

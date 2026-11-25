@@ -1,4 +1,4 @@
-use dyad::{context::DyadContext, task_group::TaskGroup, test_runtime::TestRuntime};
+use dyad::{IntoTaskGroup, test_runtime::TestRuntime};
 
 struct AppContext {
     logger: Logger,
@@ -30,15 +30,43 @@ struct AppState {
     version: u32,
 }
 
-mod m1 {
-    use dyad::{context::DyadContext, task_group::TaskGroup};
+struct AppRoot;
 
-use crate::AppContext;
+impl IntoTaskGroup<Self, AppContext> for AppRoot {
+    fn into_task_group(self) -> (Self, impl FnOnce(&mut dyad::DyadSpawner<Self, AppContext>)) {
+        (self, |spawner| {
+            spawner.spawn_task(async |dh| {
+                let context = dh.context();
+                context.logger.log(&format!(
+                    "{} v{}\n",
+                    context.app_state.title, context.app_state.version,
+                ));
+            });
+            spawner.spawn_task_group_with_context(m1::Module1Root, m1::Module1Context::new());
+        })
+    }
+}
+
+mod m1 {
+    use dyad::{ChildDyadContext, IntoTaskGroup, ParentContextHolder};
+
+    use crate::AppContext;
     use std::{cell::RefCell, ops::Deref, rc::Rc};
 
-    struct Module1Context {
+    pub(super) struct Module1Context {
         state: Module1State,
-        parent: Rc<AppContext>,
+        parent: ParentContextHolder<AppContext>,
+    }
+
+    impl Module1Context {
+        pub fn new() -> Self {
+            Self {
+                state: Module1State {
+                    new_requests: Default::default(),
+                },
+                parent: Default::default(),
+            }
+        }
     }
 
     impl Deref for Module1Context {
@@ -49,8 +77,16 @@ use crate::AppContext;
         }
     }
 
+    impl ChildDyadContext for Module1Context {
+        type Parent = AppContext;
+
+        fn parent_holder_mut(&mut self) -> &mut ParentContextHolder<Self::Parent> {
+            &mut self.parent
+        }
+    }
+
     struct Module1State {
-        new_requests: Rc::<RefCell::<Vec<String>>>,
+        new_requests: Rc<RefCell<Vec<String>>>,
     }
 
     impl Module1State {
@@ -59,29 +95,44 @@ use crate::AppContext;
         }
     }
 
-    pub fn m1_tg(pc: Rc<AppContext>) -> TaskGroup<(), Module1Context> {
-            let c = Module1Context {
-                state: Module1State { new_requests: Default::default() },
-                parent: pc,
-            };
-            let mut tg = TaskGroup::new((), DyadContext::new(c));
-            tg.spawn(async |dh| {
-                dh.with_context_mut(|c| {
-                    c.logger.log("hello");
-                })
-            });
-            tg
+    pub(super) struct Module1Root;
+
+    impl IntoTaskGroup<Self, Module1Context> for Module1Root {
+        fn into_task_group(
+            self,
+        ) -> (
+            Self,
+            impl FnOnce(&mut dyad::DyadSpawner<Self, Module1Context>),
+        ) {
+            (self, |spawner| {
+                spawner.spawn_task(async |dh| {
+                    dh.context().logger.log("m1 hello\n");
+                });
+                spawner.spawn_task_group_with_context(m2::Module2Root, m2::Module2Context::new());
+            })
+        }
     }
 
     mod m2 {
-        use dyad::{context::DyadContext, task_group::TaskGroup};
-        use std::{cell::{Cell, RefCell}, ops::Deref, rc::Rc};
+        use dyad::{ChildDyadContext, IntoTaskGroup, ParentContextHolder};
+        use std::{cell::Cell, ops::Deref};
 
-        use crate::m1::Module1Context;
+        use super::Module1Context;
 
-        struct Module2Context {
+        pub(super) struct Module2Context {
             state: Module2State,
-            parent: Rc<Module1Context>,
+            parent: ParentContextHolder<Module1Context>,
+        }
+
+        impl Module2Context {
+            pub(super) fn new() -> Self {
+                Self {
+                    state: Module2State {
+                        counter: Cell::new(0),
+                    },
+                    parent: Default::default(),
+                }
+            }
         }
 
         impl Deref for Module2Context {
@@ -92,34 +143,53 @@ use crate::AppContext;
             }
         }
 
+        impl ChildDyadContext for Module2Context {
+            type Parent = Module1Context;
+
+            fn parent_holder_mut(&mut self) -> &mut ParentContextHolder<Self::Parent> {
+                &mut self.parent
+            }
+        }
+
         struct Module2State {
             counter: Cell<usize>,
         }
 
         impl Module2State {
-            pub fn add_counter(&self, n : usize) {
+            pub fn add_counter(&self, n: usize) {
                 self.counter.set(self.counter.get() + n)
             }
         }
 
-        pub fn m2_tg(pc: Rc<Module1Context>) -> TaskGroup<(), Module2Context> {
-            let c = Module2Context {
-                state: Module2State { counter: Default::default() },
-                parent: pc,
-            };
-            let mut tg = TaskGroup::new((), DyadContext::new(c));
-            tg.spawn(async |dh| {
-                dh.with_context_mut(|c| {
-                    c.logger.log("hello");
+        pub(super) struct Module2Root;
+
+        impl IntoTaskGroup<Self, Module2Context> for Module2Root {
+            fn into_task_group(
+                self,
+            ) -> (
+                Self,
+                impl FnOnce(&mut dyad::DyadSpawner<Self, Module2Context>),
+            ) {
+                (self, |spawner| {
+                    spawner.spawn_task(async |dh| {
+                        let context = dh.context();
+                        let parent: &Module1Context = context;
+                        parent.state.add_request(String::from("request from m2"));
+                        context.state.add_counter(1);
+                        context.logger.log(&format!(
+                            "m2 hello (counter: {})\n",
+                            context.state.counter.get()
+                        ));
+                    });
                 })
-            });
-            tg
+            }
         }
     }
 }
 
 pub fn main() {
     let mut rt = TestRuntime::new();
-    let mut root_task_group = TaskGroup::new((), DyadContext::new(AppContext::new()));
-    rt.spawn_task_group(root_task_group);
+    let root = AppRoot;
+    rt.spawn_task_group(root, AppContext::new());
+    rt.run();
 }
