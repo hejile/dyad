@@ -465,19 +465,36 @@ impl<'task, S: 'static, C: 'static> DyadHandle<'task, S, C> {
         }
         shared.pred_exprs[task_index] = Some(pred_expr);
         drop(shared);
-        poll_fn(|_| {
-            let mut shared_ref_mut = self.task_group_shared.borrow_mut();
-            let pred_expr = shared_ref_mut.pred_exprs[task_index].as_ref().unwrap();
-            let ready = shared_ref_mut.eval_pred_expr(pred_expr);
-            if ready {
-                shared_ref_mut.pred_exprs[task_index] = None;
-                drop(shared_ref_mut);
-                Poll::Ready(())
-            } else {
-                drop(shared_ref_mut);
-                Poll::Pending
+
+        struct WaitUntil<'task, 'a, S, C> {
+            handle: &'a mut DyadHandle<'task, S, C>,
+        }
+
+        impl<'task, 'a, S, C> Future for WaitUntil<'task, 'a, S, C> {
+            type Output = ();
+        
+            fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                let handle = &self.as_mut().handle;
+                let task_index = handle.task_index;
+                let shared_ref = handle.task_group_shared.borrow();
+                let pred_expr = shared_ref.pred_exprs[task_index].as_ref().unwrap();
+                let ready = shared_ref.eval_pred_expr(pred_expr);
+                if ready {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
             }
-        }).await;
+        }
+
+        impl<'task, 'a, S, C> Drop for WaitUntil<'task, 'a, S, C> {
+            fn drop(&mut self) {
+                let task_index = self.handle.task_index;
+                self.handle.task_group_shared.borrow_mut().pred_exprs[task_index] = None;
+            }
+        }
+
+        WaitUntil { handle: self }.await;
     }
 }
 
