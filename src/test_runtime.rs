@@ -244,6 +244,11 @@ mod tests {
                     });
                 })
             }
+            
+            type Handle = ();
+            
+            const SHUTDOWN_ON_LAST_HANDLE_DROP: bool = false;
+            
         }
 
         let tg = SharedState {

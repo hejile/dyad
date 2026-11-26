@@ -3,7 +3,7 @@ use std::sync::{Arc, atomic::AtomicBool};
 use concurrent_queue::ConcurrentQueue;
 use slab::Slab;
 
-use crate::{IntoTaskGroup, task_group::{self, TaskGroup, UntypedTaskGroup}};
+use crate::{IntoTaskGroup, task_group::{self, TaskGroup, TaskGroupHandle, UntypedTaskGroup}};
 use crate::context::DyadContext;
 
 pub struct Executor {
@@ -22,13 +22,16 @@ impl Executor {
         }
     }
 
-    pub fn add_task_group<S, C>(&mut self, task_group: impl IntoTaskGroup<S, C>, context: C) -> usize
+    pub fn add_task_group<S, C, TG>(&mut self, task_group: TG, context: C) -> TG::Handle
     where
         S: 'static,
         C: 'static,
+        TG: IntoTaskGroup<S, C>,
     {
         let task_group = TaskGroup::new(task_group, DyadContext::new(context));
-        self.add_task_group_inner(Box::new(task_group))
+        let handle = task_group.get_handle();
+        self.add_task_group_inner(Box::new(task_group));
+        handle.into()
     }
 
     fn add_task_group_inner(&mut self, mut task_group: UntypedTaskGroup) -> usize{

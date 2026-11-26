@@ -14,7 +14,7 @@ use crate::context::DyadContext;
 use crate::executor::ExecutorShared;
 use crate::{ChildDyadContext, task_group};
 
-pub struct TaskGroup<S, C> {
+pub(crate) struct TaskGroup<S, C> {
     tasks: Slab<TaskEntry>,
     shared: Rc<RefCell<TaskGroupShared<S>>>,
     context: DyadContext<C>,
@@ -134,6 +134,12 @@ impl<S: 'static, C: 'static> TaskGroup<S, C> {
         };
         entry.insert(TaskEntry { task, waker });
         task_index
+    }
+
+    pub(crate) fn get_handle(&self) -> TaskGroupHandle<S> {
+        TaskGroupHandle {
+            task_group_shared: self.shared.clone(),
+        }
     }
 }
 
@@ -294,10 +300,6 @@ impl<S, C> TaskGroupTrait for TaskGroup<S, C> {
 // erase TaskGroup type to store in executor slab
 pub(crate) type UntypedTaskGroup = Box<dyn TaskGroupTrait>;
 
-pub struct TaskGroupHandle {
-    phantom: PhantomData<*mut ()>,
-}
-
 /// Handle passed into tasks to interact with the task group
 /// 'task lifetime ensures that the handle does not outlive the task
 pub struct DyadHandle<'task, S, C> {
@@ -308,15 +310,24 @@ pub struct DyadHandle<'task, S, C> {
 }
 
 impl<'task, S: 'static, C: 'static> DyadHandle<'task, S, C> {
-    pub fn spawn_task_group<NS: 'static>(&mut self, tg: impl IntoTaskGroup<NS, C>) {
+    pub fn spawn_task_group<NS: 'static, TG: IntoTaskGroup<NS, C>>(&mut self, tg: TG) -> TG::Handle{
         let task_group = TaskGroup::new(tg, self.context.clone());
+        let handle = task_group.get_handle();
         self.task_group_shared.borrow_mut().new_task_groups.push(Box::new(task_group));
+        handle.into()
     }
 
-    pub fn spawn_task_group_with_context<NS: 'static, NC: 'static + ChildDyadContext<Parent = C>>(&mut self, mut c: NC, tg: impl IntoTaskGroup<NS, NC>) {
+    pub fn spawn_task_group_with_context<NS, NC, TG>(&mut self, tg: TG, mut c: NC) -> TG::Handle
+    where
+        NS: 'static,
+        NC: 'static + ChildDyadContext<Parent = C>,
+        TG: IntoTaskGroup<NS, NC>
+    {
         c.parent_holder_mut().set_parent(self.context.clone());
         let task_group = TaskGroup::new(tg, DyadContext::new(c));
+        let handle = task_group.get_handle();
         self.task_group_shared.borrow_mut().new_task_groups.push(Box::new(task_group));
+        handle.into()
     }
 
     pub fn spawn<F>(&mut self, f: F)
@@ -869,19 +880,30 @@ impl<S: 'static, C: 'static> DyadSpawner<S, C> {
         self.task_group.spawn(f);
     }
     
-    pub fn spawn_task_group<NS: 'static>(&mut self, tg: impl IntoTaskGroup<NS, C>) {
+    pub fn spawn_task_group<NS: 'static, TG: IntoTaskGroup<NS, C>>(&mut self, tg: TG) -> TG::Handle {
         let task_group = TaskGroup::new(tg, self.task_group.context.clone());
+        let handle = task_group.get_handle();
         self.task_group.shared.borrow_mut().new_task_groups.push(Box::new(task_group));
+        handle.into()
     }
 
-    pub fn spawn_task_group_with_context<NS: 'static, NC: 'static + ChildDyadContext<Parent = C>>(&mut self, tg: impl IntoTaskGroup<NS, NC>, mut c: NC) {
+    pub fn spawn_task_group_with_context<NS, NC, TG>(&mut self, tg: TG, mut c: NC) -> TG::Handle
+    where
+        NS: 'static,
+        NC: 'static + ChildDyadContext<Parent = C>,
+        TG: IntoTaskGroup<NS, NC>
+    {
         c.parent_holder_mut().set_parent(self.task_group.context.clone());
         let task_group = TaskGroup::new(tg, DyadContext::new(c));
+        let handle = task_group.get_handle();
         self.task_group.shared.borrow_mut().new_task_groups.push(Box::new(task_group));
+        handle.into()
     }
 }
 
 pub trait IntoTaskGroup<S: 'static, C: 'static> {
+    type Handle : From<TaskGroupHandle<S>>;
+    const SHUTDOWN_ON_LAST_HANDLE_DROP: bool;
     fn into_task_group(self) -> (S, impl FnOnce(&mut DyadSpawner<S, C>));
 }
 
@@ -889,8 +911,26 @@ impl<S: 'static, C: 'static, F> IntoTaskGroup<S, C> for (S, F)
 where
     F: FnOnce(&mut DyadSpawner<S, C>),
 {
+    type Handle = ();
+    const SHUTDOWN_ON_LAST_HANDLE_DROP: bool = false;
+
     fn into_task_group(self) -> (S, impl FnOnce(&mut DyadSpawner<S, C>)) {
         self
+    }
+}
+
+#[must_use]
+pub struct TaskGroupHandle<S> {
+    task_group_shared: Rc<RefCell<TaskGroupShared<S>>>,
+}
+
+impl<S> TaskGroupHandle<S> {
+
+}
+
+impl<S> From<TaskGroupHandle<S>> for () {
+    fn from(_: TaskGroupHandle<S>) -> Self {
+        ()
     }
 }
 
@@ -934,6 +974,7 @@ mod tests {
         }
 
         impl IntoTaskGroup<Self, ()> for SharedState {
+            
             fn into_task_group(self) -> (Self, impl FnOnce(&mut DyadSpawner<Self, ()>)) {
                 (self, |spawner| {
                     spawner.spawn_task(async |dh| {
@@ -957,6 +998,10 @@ mod tests {
                     });
                 })
             }
+            
+            type Handle = ();
+            
+            const SHUTDOWN_ON_LAST_HANDLE_DROP: bool = false;
         }
 
         runtime.executor.add_task_group(SharedState { counter: 0 }, ());

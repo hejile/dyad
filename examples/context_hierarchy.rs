@@ -45,6 +45,10 @@ impl IntoTaskGroup<Self, AppContext> for AppRoot {
             spawner.spawn_task_group_with_context(m1::Module1Root, m1::Module1Context::new());
         })
     }
+    
+    type Handle = ();
+    
+    const SHUTDOWN_ON_LAST_HANDLE_DROP: bool = false;
 }
 
 mod m1 {
@@ -111,6 +115,10 @@ mod m1 {
                 spawner.spawn_task_group_with_context(m2::Module2Root, m2::Module2Context::new());
             })
         }
+        
+        type Handle = ();
+        
+        const SHUTDOWN_ON_LAST_HANDLE_DROP: bool = false;
     }
 
     mod m2 {
@@ -183,6 +191,10 @@ mod m1 {
                     });
                 })
             }
+            
+            type Handle = ();
+            
+            const SHUTDOWN_ON_LAST_HANDLE_DROP: bool = false;
         }
     }
 }
