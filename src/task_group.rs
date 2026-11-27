@@ -31,38 +31,7 @@ struct TaskGroupShared<S> {
         Rc<RefCell<usize>>,
     )>,
     new_task_groups: Vec<Box<dyn TaskGroupTrait>>,
-    // pridicates slab is expected to be small.
-    predicates: Slab<PredicateEntry<S>>,
-    local_states: Slab<LocalStateEntry>,
-    // should indexed with task_index, at most one pred_expr for one task
-    // we put it here for cache locality and access from DyadHandle
-    pred_exprs: Vec<Option<PredExpr>>,
-    dead_predicates: Rc<RefCell<Vec<usize>>>,
-    dead_local_states: Rc<RefCell<Vec<usize>>>,
-    changed_local_states: Rc<RefCell<Vec<usize>>>,
-}
-
-impl<S> TaskGroupShared<S> {
-    pub fn eval_pred_expr(&self, pred_expr: &PredExpr) -> bool {
-        match pred_expr {
-            PredExpr::And(lhs, rhs) => {
-                self.eval_pred_expr(lhs) && self.eval_pred_expr(rhs)
-            }
-            PredExpr::Or(lhs, rhs) => {
-                self.eval_pred_expr(lhs) || self.eval_pred_expr(rhs)
-            }
-            PredExpr::Not(inner) => {
-                !self.eval_pred_expr(inner)
-            }
-            PredExpr::Leaf(predicate_index) => {
-                if let Some(predicate_entry) = self.predicates.get(*predicate_index) {
-                    (predicate_entry.func)(&self.state)
-                } else {
-                    false
-                }
-            }
-        }
-    }
+    predicates: Vec<Option<fn(&S)->bool>>,
 }
 
 impl<S: 'static, C: 'static> TaskGroup<S, C> {
@@ -85,12 +54,7 @@ impl<S: 'static, C: 'static> TaskGroup<S, C> {
                 queue: TaskGroupQueue::new(),
                 new_tasks: Vec::new(),
                 new_task_groups: Vec::new(),
-                predicates: Slab::new(),
-                local_states: Slab::new(),
-                pred_exprs: Vec::new(),
-                dead_local_states: Rc::new(RefCell::new(Vec::new())),
-                dead_predicates: Rc::new(RefCell::new(Vec::new())),
-                changed_local_states: Rc::new(RefCell::new(Vec::new())),
+                predicates: Vec::new(),
             })),
             context,
             executor_shared: None,
@@ -185,35 +149,15 @@ impl<S, C> TaskGroupTrait for TaskGroup<S, C> {
             let shared = &mut *shared_ref_mut;
 
             if shared.state_changed {
-                for (task_index, pred_expr) in shared.pred_exprs.iter().enumerate() {
-                    if let Some(pred_expr) = pred_expr {
-                        if shared.eval_pred_expr(pred_expr) {
+                for (task_index, predicate) in shared.predicates.iter().enumerate() {
+                    if let Some(predicate) = predicate {
+                        if predicate(&shared.state) {
                             shared.queue.push(task_index);
-                        }
-                    }                    
-                }
-                shared.state_changed = false;
-            } else {
-                for local_state_index in shared.changed_local_states.borrow_mut().drain(..) {
-                    if let Some(local_state_entry) = shared.local_states.get(local_state_index) {
-                        let predicates_using = local_state_entry.predicates_using.borrow();
-                        for &predicate_index in predicates_using.iter() {
-                            if let Some(predicate_entry) = shared.predicates.get(predicate_index) {
-                                let task_index = predicate_entry.task_index;
-                                if let Some(pred_expr) = &shared.pred_exprs.get(task_index).and_then(|e| e.as_ref()) {
-                                    if shared.eval_pred_expr(pred_expr) {
-                                        shared.queue.push(task_index);
-                                    }
-                                }
-                            }
                         }
                     }
                 }
+                shared.state_changed = false;
             }
-
-            // Remove predicates belonging to dead tasks
-            shared.predicates.retain(
-                |_, predicate_entry| !dead_tasks.contains(&predicate_entry.task_index));
 
             for task_index in dead_tasks.drain(..) {
                 self.tasks.remove(task_index);
@@ -232,31 +176,6 @@ impl<S, C> TaskGroupTrait for TaskGroup<S, C> {
                 let task = Task { future };
                 entry.insert(TaskEntry { task, waker });
                 shared.queue.push(task_index);
-            }
-        }
-
-        {
-            let shared = &mut *self.shared.borrow_mut();
-            // Clean up dead predicates
-            for predicate_index in shared.dead_predicates.borrow_mut().drain(..) {
-                // Predicates can be removed through multiple paths:
-                // - explicit handle drop queues the index into `dead_predicates`
-                // - task exit removes all predicates belonging to the dead task via `retain`
-                // So this cleanup must be idempotent.
-                if shared.predicates.contains(predicate_index) {
-                    shared.predicates.remove(predicate_index);
-                }
-            }
-            // Clean up dead local states
-            for local_state_index in shared.dead_local_states.borrow_mut().drain(..) {
-                // it's possible same local index is added multiple times
-                // handle drop -> bind with key -> handle drop again
-                if let Some(entry) = shared.local_states.get(local_state_index) {
-                    if Rc::strong_count(&entry.state) == 1 {
-                        // no other references
-                        shared.local_states.remove(local_state_index);
-                    }
-                }
             }
         }
     }
@@ -382,88 +301,13 @@ impl<'task, S: 'static, C: 'static> DyadHandle<'task, S, C> {
         &self.context
     }
 
-    pub fn add_predicate<F>(&mut self, predicate: F) -> PredicateHandle<'task>
-    where
-        F: Fn(&S) -> bool + 'static,
-    {
-        let mut shared = self.task_group_shared.borrow_mut();
-        let predicate_index = shared.predicates.insert(PredicateEntry {
-            func: Box::new(predicate),
-            task_index: self.task_index,
-            is_active: Cell::new(true),
-        });
-        PredicateHandle {
-            predicate_index,
-            dead_predicates: shared.dead_predicates.clone(),
-            phantom: PhantomData,
-        }
-    }
-
-    pub fn add_predicate_with_state<F>(&mut self, mut predicate: F) -> PredicateHandle<'task>
-    where
-        F: FnMut(&mut LocalStateInPredicateBinder) -> Box<dyn Fn(&S) -> bool> + 'static,
-    {
-        let shared = &mut *self.task_group_shared.borrow_mut();
-        let entry = shared.predicates.vacant_entry();
-        let predicate_index = entry.key();
-        let mut binder = LocalStateInPredicateBinder {
-            local_states: &shared.local_states,
-            dead_local_states: &shared.dead_local_states,
-            predicate_index,
-        };
-        let predicate_func = predicate(&mut binder);
-        entry.insert(PredicateEntry {
-            func: predicate_func,
-            task_index: self.task_index,
-            is_active: Cell::new(true),
-        });
-        PredicateHandle {
-            predicate_index,
-            dead_predicates: shared.dead_predicates.clone(),
-            phantom: PhantomData,
-        }
-    }
-
-    pub fn create_local_state<T: 'static>(&mut self, state: T) -> LocalStateHandle<'task, T> {
-        let mut shared = self.task_group_shared.borrow_mut();
-        let local_state_index = shared.local_states.insert(LocalStateEntry {
-            state: Rc::new(RefCell::new(state)),
-            predicates_using: Rc::new(RefCell::new(Vec::new())),
-        });
-        LocalStateHandle {
-            local_state_index,
-            state: shared
-                .local_states
-                .get(local_state_index)
-                .unwrap()
-                .state
-                .clone(),
-            dead_local_states: shared.dead_local_states.clone(),
-            changed_local_states: shared.changed_local_states.clone(),
-            phantom: PhantomData,
-        }
-    }
-
-    pub fn bind_local_state<T>(&mut self, key: LocalStateKey<T>) -> LocalStateHandle<'task, T> {
-        let shared = &mut *self.task_group_shared.borrow_mut();
-        let local_state_entry = &shared.local_states[key.local_state_index];
-        LocalStateHandle {
-            local_state_index: key.local_state_index,
-            state: local_state_entry.state.clone(),
-            dead_local_states: shared.dead_local_states.clone(),
-            changed_local_states: shared.changed_local_states.clone(),
-            phantom: PhantomData,
-        }
-    }
-
-    pub async fn wait_until(&mut self, pred_expr: impl Into<PredExpr>) {
-        let pred_expr = pred_expr.into();
+    pub async fn wait_until(&mut self, predicate: fn(&S) -> bool) {
         let mut shared = self.task_group_shared.borrow_mut();
         let task_index = self.task_index;
-        if shared.pred_exprs.len() <= task_index {
-            shared.pred_exprs.resize_with(task_index + 1, || None);
+        if shared.predicates.len() <= task_index {
+            shared.predicates.resize_with(task_index + 1, || None);
         }
-        shared.pred_exprs[task_index] = Some(pred_expr);
+        shared.predicates[task_index] = Some(predicate);
         drop(shared);
 
         struct WaitUntil<'task, 'a, S, C> {
@@ -477,8 +321,8 @@ impl<'task, S: 'static, C: 'static> DyadHandle<'task, S, C> {
                 let handle = &self.as_mut().handle;
                 let task_index = handle.task_index;
                 let shared_ref = handle.task_group_shared.borrow();
-                let pred_expr = shared_ref.pred_exprs[task_index].as_ref().unwrap();
-                let ready = shared_ref.eval_pred_expr(pred_expr);
+                let predicate = shared_ref.predicates[task_index].as_ref().unwrap();
+                let ready = predicate(&shared_ref.state);
                 if ready {
                     Poll::Ready(())
                 } else {
@@ -490,49 +334,11 @@ impl<'task, S: 'static, C: 'static> DyadHandle<'task, S, C> {
         impl<'task, 'a, S, C> Drop for WaitUntil<'task, 'a, S, C> {
             fn drop(&mut self) {
                 let task_index = self.handle.task_index;
-                self.handle.task_group_shared.borrow_mut().pred_exprs[task_index] = None;
+                self.handle.task_group_shared.borrow_mut().predicates[task_index] = None;
             }
         }
 
         WaitUntil { handle: self }.await;
-    }
-}
-
-struct PredicateEntry<S> {
-    func: Box<dyn Fn(&S) -> bool>,
-    task_index: usize,
-    is_active: Cell<bool>,
-}
-
-pub struct PredicateHandle<'task> {
-    predicate_index: usize,
-    dead_predicates: Rc<RefCell<Vec<usize>>>,
-    phantom: PhantomData<*mut &'task ()>, // Invariant over 'task
-}
-
-impl<'task> PredicateHandle<'task> {
-    pub fn is_ready<S, C>(&self, dyad_handle: &DyadHandle<S, C>) -> bool {
-        let shared = dyad_handle.task_group_shared.borrow();
-        let predicate_entry = &shared.predicates[self.predicate_index];
-        (predicate_entry.func)(&shared.state)
-    }
-
-    pub fn set_active<S, C>(&self, dyad_handle: &mut DyadHandle<S, C>, is_active: bool) {
-        let shared = dyad_handle.task_group_shared.borrow_mut();
-        shared.predicates[self.predicate_index]
-            .is_active
-            .set(is_active);
-    }
-
-    pub fn is_active<S, C>(&self, dyad_handle: &DyadHandle<S, C>) -> bool {
-        let shared = dyad_handle.task_group_shared.borrow();
-        shared.predicates[self.predicate_index].is_active.get()
-    }
-}
-
-impl<'task> Drop for PredicateHandle<'task> {
-    fn drop(&mut self) {
-        self.dead_predicates.borrow_mut().push(self.predicate_index);
     }
 }
 
@@ -672,219 +478,6 @@ impl Iterator for BitmapIter {
     }
 }
 
-struct LocalStateEntry {
-    state: Rc<RefCell<dyn Any>>,
-    predicates_using: Rc<RefCell<Vec<usize>>>,
-}
-
-pub struct LocalStateHandle<'task, T> {
-    local_state_index: usize,
-    state: Rc<RefCell<dyn Any>>,
-    dead_local_states: Rc<RefCell<Vec<usize>>>,
-    changed_local_states: Rc<RefCell<Vec<usize>>>,
-    phantom: PhantomData<*mut &'task T>, // Invariant over 'task
-}
-
-pub struct LocalStateInPredictateHandle<T> {
-    local_state_index: usize,
-    state: Rc<RefCell<dyn Any>>,
-    dead_local_states: Rc<RefCell<Vec<usize>>>,
-    phantom: PhantomData<*mut T>,
-}
-
-impl<T: Any> LocalStateInPredictateHandle<T> {
-    pub fn access<R, F>(&self, f: F) -> R
-    where
-        F: FnOnce(&T) -> R,
-    {
-        let state = self.state.borrow();
-        let typed_state = state.downcast_ref::<T>().expect("LocalState type mismatch");
-        f(typed_state)
-    }
-}
-
-impl<T> Drop for LocalStateInPredictateHandle<T> {
-    fn drop(&mut self) {
-        // there is always at least one Rc reference from the local_states slab
-        if Rc::strong_count(&self.state) == 2 {
-            self.dead_local_states
-                .borrow_mut()
-                .push(self.local_state_index);
-        }
-    }
-}
-
-impl<'task, T: Any> LocalStateHandle<'task, T> {
-    pub fn access<R, F>(&self, f: F) -> R
-    where
-        F: FnOnce(&T) -> R,
-    {
-        let state = self.state.borrow();
-        let typed_state = state.downcast_ref::<T>().expect("LocalState type mismatch");
-        f(typed_state)
-    }
-
-    pub fn modify<R, F>(&mut self, f: F) -> R
-    where
-        F: FnOnce(&mut T) -> R,
-    {
-        self.changed_local_states
-            .borrow_mut()
-            .push(self.local_state_index);
-        let mut state = self.state.borrow_mut();
-        let typed_state = state.downcast_mut::<T>().expect("LocalState type mismatch");
-        f(typed_state)
-    }
-
-    pub fn key(&self) -> LocalStateKey<T> {
-        LocalStateKey {
-            local_state_index: self.local_state_index,
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<'task, T> Drop for LocalStateHandle<'task, T> {
-    fn drop(&mut self) {
-        // there is always at least one Rc reference from the local_states slab
-        if Rc::strong_count(&self.state) == 2 {
-            self.dead_local_states
-                .borrow_mut()
-                .push(self.local_state_index);
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct LocalStateKey<T> {
-    local_state_index: usize,
-    phantom: PhantomData<Rc<T>>,
-}
-
-pub struct LocalStateInPredicateBinder<'a> {
-    local_states: &'a Slab<LocalStateEntry>,
-    dead_local_states: &'a Rc<RefCell<Vec<usize>>>,
-    predicate_index: usize,
-}
-
-impl<'a> LocalStateInPredicateBinder<'a> {
-    pub fn bind<T>(&mut self, key: LocalStateKey<T>) -> LocalStateInPredictateHandle<T> {
-        let local_state_entry = self
-            .local_states
-            .get(key.local_state_index)
-            .expect("LocalState dropped");
-        local_state_entry
-            .predicates_using
-            .borrow_mut()
-            .push(self.predicate_index);
-        LocalStateInPredictateHandle {
-            state: local_state_entry.state.clone(),
-            local_state_index: key.local_state_index,
-            dead_local_states: self.dead_local_states.clone(),
-            phantom: PhantomData,
-        }
-    }
-}
-
-pub enum PredExpr {
-    And(Box<PredExpr>, Box<PredExpr>),
-    Or(Box<PredExpr>, Box<PredExpr>),
-    Not(Box<PredExpr>),
-    Leaf(usize),
-}
-
-impl BitAnd for PredExpr {
-    type Output = PredExpr;
-
-    fn bitand(self, rhs: Self) -> Self::Output {
-        PredExpr::And(Box::new(self), Box::new(rhs))
-    }
-}
-
-impl BitAnd<&PredicateHandle<'_>> for PredExpr {
-    type Output = PredExpr;
-
-    fn bitand(self, rhs: &PredicateHandle<'_>) -> Self::Output {
-        PredExpr::And(Box::new(self), Box::new(PredExpr::Leaf(rhs.predicate_index)))
-    }
-}
-
-impl BitAnd<PredExpr> for &PredicateHandle<'_> {
-    type Output = PredExpr;
-
-    fn bitand(self, rhs: PredExpr) -> Self::Output {
-        PredExpr::And(Box::new(PredExpr::Leaf(self.predicate_index)), Box::new(rhs))
-    }
-}
-
-impl BitAnd<&PredicateHandle<'_>> for &PredicateHandle<'_> {
-    type Output = PredExpr;
-
-    fn bitand(self, rhs: &PredicateHandle<'_>) -> Self::Output {
-        PredExpr::And(
-            Box::new(PredExpr::Leaf(self.predicate_index)),
-            Box::new(PredExpr::Leaf(rhs.predicate_index)),
-        )
-    }
-}
-
-impl BitOr for PredExpr {
-    type Output = PredExpr;
-
-    fn bitor(self, rhs: Self) -> Self::Output {
-        PredExpr::Or(Box::new(self), Box::new(rhs))
-    }
-}
-
-impl BitOr<&PredicateHandle<'_>> for PredExpr {
-    type Output = PredExpr;
-
-    fn bitor(self, rhs: &PredicateHandle<'_>) -> Self::Output {
-        PredExpr::Or(Box::new(self), Box::new(PredExpr::Leaf(rhs.predicate_index)))
-    }
-}
-
-impl BitOr<PredExpr> for &PredicateHandle<'_> {
-    type Output = PredExpr;
-
-    fn bitor(self, rhs: PredExpr) -> Self::Output {
-        PredExpr::Or(Box::new(PredExpr::Leaf(self.predicate_index)), Box::new(rhs))
-    }
-}
-
-impl BitOr<&PredicateHandle<'_>> for &PredicateHandle<'_> {
-    type Output = PredExpr;
-
-    fn bitor(self, rhs: &PredicateHandle<'_>) -> Self::Output {
-        PredExpr::Or(
-            Box::new(PredExpr::Leaf(self.predicate_index)),
-            Box::new(PredExpr::Leaf(rhs.predicate_index)),
-        )
-    }
-}
-
-impl Not for PredExpr {
-    type Output = PredExpr;
-
-    fn not(self) -> Self::Output {
-        PredExpr::Not(Box::new(self))
-    }
-}
-
-impl Not for &PredicateHandle<'_> {
-    type Output = PredExpr;
-
-    fn not(self) -> Self::Output {
-        PredExpr::Not(Box::new(PredExpr::Leaf(self.predicate_index)))
-    }
-}
-
-impl From<&PredicateHandle<'_>> for PredExpr {
-    fn from(handle: &PredicateHandle<'_>) -> Self {
-        PredExpr::Leaf(handle.predicate_index)
-    }
-}
-
 pub struct DyadSpawner<S, C> {
     task_group: TaskGroup<S, C>,
 }
@@ -983,11 +576,21 @@ mod tests {
     }
 
     #[test]
-    fn test_local_state() {
+    fn test_basic_task_group1() {
         let mut runtime = TestRuntime::new();
 
         struct SharedState {
             counter: usize,
+            threshold: usize,
+        }
+
+        impl SharedState {
+            fn new() -> Self {
+                Self {
+                    counter: 0,
+                    threshold: 0,
+                }
+            }
         }
 
         impl IntoTaskGroup<Self, ()> for SharedState {
@@ -995,23 +598,15 @@ mod tests {
             fn into_task_group(self) -> (Self, impl FnOnce(&mut DyadSpawner<Self, ()>)) {
                 (self, |spawner| {
                     spawner.spawn_task(async |dh| {
-                        let local_state = dh.create_local_state::<usize>(0usize);
-                        let local_state_key = local_state.key();
-                        let p1 = dh.add_predicate_with_state(move |binder| {
-                            let local_handle = binder.bind::<usize>(local_state_key);
-                            Box::new(move |s: &SharedState| {
-                                let local_value = local_handle.access(|v| *v);
-                                s.counter < local_value
-                            })
-                        });
+                        dh.modify(|s| s.threshold = 5);
                         dh.spawn(async move |dh| {
-                            let mut local_state = dh.bind_local_state(local_state_key);
-
-                            sleep_cycles(10).await;
-                            local_state.modify(|v| *v = 5);
+                            for _ in 0..10 {
+                                sleep_cycles(1).await;
+                                dh.modify(|s| s.counter += 1);
+                            }
                         });
-                        dh.wait_until(&p1).await;
-                        println!("Predicate satisfied: counter < local_state");
+                        dh.wait_until(|s| s.counter >= s.threshold).await;
+                        println!("Predicate satisfied: counter >= 5");
                     });
                 })
             }
@@ -1021,7 +616,7 @@ mod tests {
             const SHUTDOWN_ON_LAST_HANDLE_DROP: bool = false;
         }
 
-        runtime.executor.add_task_group(SharedState { counter: 0 }, ());
+        runtime.executor.add_task_group(SharedState::new(), ());
         runtime.run();
     }
 }

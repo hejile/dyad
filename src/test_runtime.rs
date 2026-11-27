@@ -222,24 +222,20 @@ mod tests {
                     });
 
                     spawner.spawn_task(async |dh| {
-                        let msg_available = dh.add_predicate(|s| !s.msgs.is_empty());
-                        let sender_done = dh.add_predicate(|s| s.sender_done);
-
                         let mut count = 0;
                         loop {
-                            count += 1;
-                            println!("receiver waiting at iteration {}", count);
-                            dh.wait_until(&msg_available | &sender_done).await;
-                            if sender_done.is_ready(&dh) {
+                            dh.wait_until(|s| !s.msgs.is_empty() | s.sender_done).await;
+                            if dh.access(|s| s.sender_done) {
                                 println!("Sender done");
                                 break;
                             }
-                            if msg_available.is_ready(&dh) {
-                                let msgs = dh.modify(|s| std::mem::take(&mut s.msgs));
-                                for msg in msgs {
+                            count += 1;
+                            println!("receiver waiting at iteration {}", count);
+                            dh.modify(|s| {
+                                for msg in s.msgs.drain(..) {
                                     println!("Received: {}", msg);
                                 }
-                            }
+                            });
                         }
                     });
                 })
